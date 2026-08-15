@@ -61,6 +61,12 @@ public:
         order_index_.erase(index_it);
         order_owners_.erase(order_id);
 
+        if (owner->empty()) {
+            if (owner == &bids_[0.0]) {
+                // no-op guard; not used because price-level maps are only constructed with actual prices
+            }
+        }
+
         return true;
     }
 
@@ -90,6 +96,42 @@ public:
                       << "\n";
         }
         std::cout << "==================\n";
+    }
+
+    void get_snapshot(int depth) const {
+        std::cout << "\n=== Market Data Snapshot (depth=" << depth << ") ===\n";
+
+        std::cout << "Best Bids:\n";
+        int bid_count = 0;
+        for (BidBook::const_iterator it = bids_.begin(); it != bids_.end() && bid_count < depth; ++it, ++bid_count) {
+            const double& price = it->first;
+            const std::list<Order>& orders = it->second;
+            long long total_volume = 0;
+            int order_count = 0;
+            for (const auto& order : orders) {
+                total_volume += order.quantity;
+                ++order_count;
+            }
+            std::cout << "  " << std::fixed << std::setprecision(2) << price
+                      << " | Vol " << total_volume << " | Orders " << order_count << "\n";
+        }
+
+        std::cout << "Best Asks:\n";
+        int ask_count = 0;
+        for (AskBook::const_iterator it = asks_.begin(); it != asks_.end() && ask_count < depth; ++it, ++ask_count) {
+            const double& price = it->first;
+            const std::list<Order>& orders = it->second;
+            long long total_volume = 0;
+            int order_count = 0;
+            for (const auto& order : orders) {
+                total_volume += order.quantity;
+                ++order_count;
+            }
+            std::cout << "  " << std::fixed << std::setprecision(2) << price
+                      << " | Vol " << total_volume << " | Orders " << order_count << "\n";
+        }
+
+        std::cout << "============================\n";
     }
 
 private:
@@ -128,6 +170,8 @@ private:
             if (best_ask.quantity == 0) {
                 remove_from_index(best_ask.id);
                 best_ask_list.pop_front();
+            } else {
+                update_order_index(best_ask);
             }
 
             if (best_ask_list.empty()) {
@@ -170,6 +214,8 @@ private:
             if (best_bid.quantity == 0) {
                 remove_from_index(best_bid.id);
                 best_bid_list.pop_front();
+            } else {
+                update_order_index(best_bid);
             }
 
             if (best_bid_list.empty()) {
@@ -191,6 +237,19 @@ private:
         auto it = std::prev(level->end());
         order_index_[resting_order.id] = it;
         order_owners_[resting_order.id] = level;
+    }
+
+    void update_order_index(const Order& order) {
+        auto owner_it = order_owners_.find(order.id);
+        if (owner_it != order_owners_.end()) {
+            std::list<Order>* owner = owner_it->second;
+            for (auto it = owner->begin(); it != owner->end(); ++it) {
+                if (it->id == order.id) {
+                    order_index_[order.id] = it;
+                    return;
+                }
+            }
+        }
     }
 
     void remove_from_index(uint64_t order_id) {
@@ -238,16 +297,22 @@ int main() {
 
     std::cout << "Production-grade Limit Order Book Demo\n";
 
-    book.add_order({1, 100.00, 10, true});
-    book.add_order({2, 99.50, 8, false});
-    book.add_order({3, 101.00, 5, true});
-    book.add_order({4, 100.50, 12, false});
-    book.add_order({5, 100.80, 7, true});
-    book.add_order({6, 100.20, 18, false});
-    book.add_order({7, 99.80, 4, true});
+    std::cout << "\n--- Price-Time Priority / Partial Fill Demo ---\n";
+    uint64_t buy_1 = book.add_order(100.00, 10, true);
+    uint64_t buy_2 = book.add_order(100.00, 8, true);
+    uint64_t sell_1 = book.add_order(99.50, 12, false);
+    uint64_t sell_2 = book.add_order(99.50, 6, false);
 
-    std::cout << "\nCancel order 5: " << (book.cancel_order(5) ? "CANCELLED" : "NOT_FOUND") << "\n";
-    book.print_book();
+    std::cout << "\nCancel order " << buy_2 << ": " << (book.cancel_order(buy_2) ? "CANCELLED" : "NOT_FOUND") << "\n";
+    book.get_snapshot(5);
+
+    std::cout << "\n--- Partial Fill / Queue Retention Demo ---\n";
+    uint64_t aggressor_buy = book.add_order(100.20, 5, true);
+    (void)aggressor_buy;
+    std::cout << "\nAfter partial fill demo:\n";
+    book.get_snapshot(5);
+
+    std::cout << "\nCancel order " << sell_1 << ": " << (book.cancel_order(sell_1) ? "CANCELLED" : "NOT_FOUND") << "\n";
 
     benchmark_random_orders(book, 100000);
     return 0;
