@@ -15,8 +15,28 @@
 enum class OrderType {
     GTC,
     IOC,
-    FOK
+    FOK,
+    POST_ONLY
 };
+
+enum class OrderStatus {
+    NEW,
+    PARTIALLY_FILLED,
+    FILLED,
+    CANCELED,
+    REJECTED
+};
+
+inline const char* order_status_to_string(OrderStatus status) {
+    switch (status) {
+        case OrderStatus::NEW: return "NEW";
+        case OrderStatus::PARTIALLY_FILLED: return "PARTIALLY_FILLED";
+        case OrderStatus::FILLED: return "FILLED";
+        case OrderStatus::CANCELED: return "CANCELED";
+        case OrderStatus::REJECTED: return "REJECTED";
+        default: return "UNKNOWN";
+    }
+}
 
 struct Order {
     uint64_t id;
@@ -24,6 +44,7 @@ struct Order {
     long long quantity;
     bool is_buy;
     OrderType type{OrderType::GTC};
+    OrderStatus status{OrderStatus::NEW};
 };
 
 struct LevelSnapshot {
@@ -47,7 +68,7 @@ public:
             return 0;
         }
 
-        Order order{next_order_id_++, price, quantity, is_buy, type};
+        Order order{next_order_id_++, price, quantity, is_buy, type, OrderStatus::NEW};
         return add_order(order);
     }
 
@@ -55,6 +76,19 @@ public:
         if (incoming_order.quantity <= 0) {
             std::cout << "Order " << incoming_order.id << " has invalid quantity.\n";
             return 0;
+        }
+
+        if (incoming_order.type == OrderType::POST_ONLY) {
+            if (incoming_order.is_buy && !asks_.empty() && incoming_order.price >= asks_.begin()->first) {
+                std::cout << "POST_ONLY: BUY " << incoming_order.id << " rejected because it would match immediately.\n";
+                update_order_status(incoming_order.id, OrderStatus::REJECTED);
+                return incoming_order.id;
+            }
+            if (!incoming_order.is_buy && !bids_.empty() && incoming_order.price <= bids_.begin()->first) {
+                std::cout << "POST_ONLY: SELL " << incoming_order.id << " rejected because it would match immediately.\n";
+                update_order_status(incoming_order.id, OrderStatus::REJECTED);
+                return incoming_order.id;
+            }
         }
 
         if (incoming_order.is_buy) {
@@ -79,6 +113,7 @@ public:
         owner->erase(index_it->second);
         order_index_.erase(index_it);
         order_owners_.erase(order_id);
+        update_order_status(order_id, OrderStatus::CANCELED);
 
         return true;
     }
@@ -139,6 +174,36 @@ public:
         return snapshot;
     }
 
+    LevelSnapshot get_best_bid() const {
+        if (bids_.empty()) {
+            return LevelSnapshot{0.0, 0, 0};
+        }
+
+        LevelSnapshot level;
+        auto it = bids_.begin();
+        level.price = it->first;
+        for (const auto& order : it->second) {
+            level.total_volume += order.quantity;
+            ++level.order_count;
+        }
+        return level;
+    }
+
+    LevelSnapshot get_best_ask() const {
+        if (asks_.empty()) {
+            return LevelSnapshot{0.0, 0, 0};
+        }
+
+        LevelSnapshot level;
+        auto it = asks_.begin();
+        level.price = it->first;
+        for (const auto& order : it->second) {
+            level.total_volume += order.quantity;
+            ++level.order_count;
+        }
+        return level;
+    }
+
     void get_snapshot(int depth) const {
         SnapshotData snapshot = get_snapshot_data(depth);
 
@@ -157,6 +222,18 @@ public:
         std::cout << "============================\n";
     }
 
+    OrderStatus get_order_status(uint64_t order_id) const {
+        auto it = order_status_.find(order_id);
+        if (it == order_status_.end()) {
+            return OrderStatus::REJECTED;
+        }
+        return it->second;
+    }
+
+    const char* get_order_status_string(uint64_t order_id) const {
+        return order_status_to_string(get_order_status(order_id));
+    }
+
 private:
     using BidBook = std::map<double, std::list<Order>, std::greater<double>>;
     using AskBook = std::map<double, std::list<Order>, std::less<double>>;
@@ -165,6 +242,7 @@ private:
     AskBook asks_;
     std::unordered_map<uint64_t, std::list<Order>::iterator> order_index_;
     std::unordered_map<uint64_t, std::list<Order>*> order_owners_;
+    std::unordered_map<uint64_t, OrderStatus> order_status_;
     uint64_t next_order_id_;
 
     uint64_t match_buy(const Order& incoming_order) {
@@ -173,6 +251,7 @@ private:
         if (incoming_order.type == OrderType::FOK) {
             if (!can_fully_fill_buy(remaining)) {
                 std::cout << "FOK: BUY " << remaining.id << " rejected, not enough liquidity to fill entire quantity.\n";
+                update_order_status(remaining.id, OrderStatus::REJECTED);
                 return remaining.id;
             }
         }
@@ -196,6 +275,7 @@ private:
 
             remaining.quantity -= trade_qty;
             best_ask.quantity -= trade_qty;
+            update_order_status(best_ask.id, best_ask.quantity == 0 ? OrderStatus::FILLED : OrderStatus::PARTIALLY_FILLED);
 
             if (best_ask.quantity == 0) {
                 remove_from_index(best_ask.id);
@@ -213,11 +293,15 @@ private:
             if (incoming_order.type == OrderType::IOC) {
                 std::cout << "IOC: BUY " << remaining.id << " canceled " << remaining.quantity
                           << " unfilled units.\n";
-            } else if (incoming_order.type == OrderType::GTC) {
+                update_order_status(remaining.id, OrderStatus::CANCELED);
+            } else if (incoming_order.type == OrderType::GTC || incoming_order.type == OrderType::POST_ONLY) {
                 add_resting_order(remaining, &bids_[remaining.price]);
+                update_order_status(remaining.id, remaining.quantity < incoming_order.quantity ? OrderStatus::PARTIALLY_FILLED : OrderStatus::NEW);
                 std::cout << "ORDER REST: BUY " << remaining.id << " left resting " << remaining.quantity
                           << " @ " << std::fixed << std::setprecision(2) << remaining.price << "\n";
             }
+        } else {
+            update_order_status(remaining.id, OrderStatus::FILLED);
         }
 
         return incoming_order.id;
@@ -229,6 +313,7 @@ private:
         if (incoming_order.type == OrderType::FOK) {
             if (!can_fully_fill_sell(remaining)) {
                 std::cout << "FOK: SELL " << remaining.id << " rejected, not enough liquidity to fill entire quantity.\n";
+                update_order_status(remaining.id, OrderStatus::REJECTED);
                 return remaining.id;
             }
         }
@@ -252,6 +337,7 @@ private:
 
             remaining.quantity -= trade_qty;
             best_bid.quantity -= trade_qty;
+            update_order_status(best_bid.id, best_bid.quantity == 0 ? OrderStatus::FILLED : OrderStatus::PARTIALLY_FILLED);
 
             if (best_bid.quantity == 0) {
                 remove_from_index(best_bid.id);
@@ -269,11 +355,15 @@ private:
             if (incoming_order.type == OrderType::IOC) {
                 std::cout << "IOC: SELL " << remaining.id << " canceled " << remaining.quantity
                           << " unfilled units.\n";
-            } else if (incoming_order.type == OrderType::GTC) {
+                update_order_status(remaining.id, OrderStatus::CANCELED);
+            } else if (incoming_order.type == OrderType::GTC || incoming_order.type == OrderType::POST_ONLY) {
                 add_resting_order(remaining, &asks_[remaining.price]);
+                update_order_status(remaining.id, remaining.quantity < incoming_order.quantity ? OrderStatus::PARTIALLY_FILLED : OrderStatus::NEW);
                 std::cout << "ORDER REST: SELL " << remaining.id << " left resting " << remaining.quantity
                           << " @ " << std::fixed << std::setprecision(2) << remaining.price << "\n";
             }
+        } else {
+            update_order_status(remaining.id, OrderStatus::FILLED);
         }
 
         return incoming_order.id;
@@ -316,6 +406,15 @@ private:
         auto it = std::prev(level->end());
         order_index_[resting_order.id] = it;
         order_owners_[resting_order.id] = level;
+    }
+
+    void update_order_status(uint64_t order_id, OrderStatus status) {
+        auto it = order_status_.find(order_id);
+        if (it == order_status_.end()) {
+            order_status_[order_id] = status;
+            return;
+        }
+        it->second = status;
     }
 
     void update_order_index(const Order& order) {
@@ -386,35 +485,40 @@ int main() {
 
     std::cout << "Production-grade Limit Order Book Demo\n";
 
-    std::cout << "\n--- IOC / FOK / Snapshot Demo ---\n";
-    auto it0 = book.add_order(100.00, 10, true); // GTC buy
-    auto it1 = book.add_order(100.00, 8, true);  // GTC buy
-    auto it2 = book.add_order(99.50, 12, false); // GTC sell
-    auto it3 = book.add_order(99.50, 6, false);  // GTC sell
-    (void)it0;
-    (void)it1;
-    (void)it2;
-    (void)it3;
+    std::cout << "\n--- IOC / FOK / POST_ONLY / Snapshot Demo ---\n";
+    auto buy1 = book.add_order(100.00, 10, true);
+    auto buy2 = book.add_order(100.00, 8, true);
+    auto sell1 = book.add_order(99.50, 12, false);
+    auto sell2 = book.add_order(99.50, 6, false);
+    (void)buy1;
+    (void)buy2;
+    (void)sell1;
+    (void)sell2;
 
-    std::cout << "\nBefore IOC/FOK checks:\n";
+    std::cout << "\nPOST_ONLY rejected because it would cross:\n";
+    book.add_order(99.60, 5, true, OrderType::POST_ONLY);
+    std::cout << "Best bid: " << std::fixed << std::setprecision(2) << book.get_best_bid().price
+              << " | Best ask: " << std::fixed << std::setprecision(2) << book.get_best_ask().price << "\n";
+
+    std::cout << "\nIOC buy test:\n";
+    auto ioc_buy = book.add_order(100.20, 25, true, OrderType::IOC);
+    std::cout << "IOC buy status: " << (book.get_order_status(ioc_buy) == OrderStatus::CANCELED ? "CANCELED" : "OTHER") << "\n";
     book.get_snapshot(5);
 
-    std::cout << "\nIOC buy test: \n";
-    book.add_order(100.20, 25, true, OrderType::IOC);
-    book.get_snapshot(5);
-
-    std::cout << "\nFOK sell test: \n";
-    book.add_order(99.80, 50, false, OrderType::FOK);
+    std::cout << "\nFOK sell test:\n";
+    auto fok_sell = book.add_order(99.80, 50, false, OrderType::FOK);
+    std::cout << "FOK sell status: " << (book.get_order_status(fok_sell) == OrderStatus::REJECTED ? "REJECTED" : "OTHER") << "\n";
     book.get_snapshot(5);
 
     std::cout << "\n--- Partial Fill / Queue Retention Demo ---\n";
     auto buy_id = book.add_order(101.00, 15, true);
     auto sell_id = book.add_order(100.50, 20, false);
-    (void)buy_id;
-    (void)sell_id;
+    std::cout << "Buy status: " << (book.get_order_status(buy_id) == OrderStatus::NEW ? "NEW" : "OTHER") << "\n";
+    std::cout << "Sell status: " << (book.get_order_status(sell_id) == OrderStatus::PARTIALLY_FILLED ? "PARTIALLY_FILLED" : "OTHER") << "\n";
     book.get_snapshot(5);
 
     std::cout << "\nCancel order " << buy_id << ": " << (book.cancel_order(buy_id) ? "CANCELLED" : "NOT_FOUND") << "\n";
+    std::cout << "Order " << buy_id << " status after cancel: " << (book.get_order_status(buy_id) == OrderStatus::CANCELED ? "CANCELED" : "OTHER") << "\n";
 
     benchmark_random_orders(book, 100000);
     return 0;
