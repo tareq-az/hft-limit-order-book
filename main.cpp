@@ -10,25 +10,44 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
+
+enum class OrderType {
+    GTC,
+    IOC,
+    FOK
+};
 
 struct Order {
     uint64_t id;
     double price;
     long long quantity;
     bool is_buy;
+    OrderType type{OrderType::GTC};
+};
+
+struct LevelSnapshot {
+    double price = 0.0;
+    long long total_volume = 0;
+    int order_count = 0;
+};
+
+struct SnapshotData {
+    std::vector<LevelSnapshot> bids;
+    std::vector<LevelSnapshot> asks;
 };
 
 class OrderBook {
 public:
     OrderBook() : next_order_id_(1) {}
 
-    uint64_t add_order(double price, long long quantity, bool is_buy) {
+    uint64_t add_order(double price, long long quantity, bool is_buy, OrderType type = OrderType::GTC) {
         if (quantity <= 0) {
             std::cout << "Order has invalid quantity.\n";
             return 0;
         }
 
-        Order order{next_order_id_++, price, quantity, is_buy};
+        Order order{next_order_id_++, price, quantity, is_buy, type};
         return add_order(order);
     }
 
@@ -61,12 +80,6 @@ public:
         order_index_.erase(index_it);
         order_owners_.erase(order_id);
 
-        if (owner->empty()) {
-            if (owner == &bids_[0.0]) {
-                // no-op guard; not used because price-level maps are only constructed with actual prices
-            }
-        }
-
         return true;
     }
 
@@ -98,39 +111,49 @@ public:
         std::cout << "==================\n";
     }
 
-    void get_snapshot(int depth) const {
-        std::cout << "\n=== Market Data Snapshot (depth=" << depth << ") ===\n";
-
-        std::cout << "Best Bids:\n";
+    SnapshotData get_snapshot_data(int depth) const {
+        SnapshotData snapshot;
         int bid_count = 0;
+
         for (BidBook::const_iterator it = bids_.begin(); it != bids_.end() && bid_count < depth; ++it, ++bid_count) {
-            const double& price = it->first;
-            const std::list<Order>& orders = it->second;
-            long long total_volume = 0;
-            int order_count = 0;
-            for (const auto& order : orders) {
-                total_volume += order.quantity;
-                ++order_count;
+            LevelSnapshot level;
+            level.price = it->first;
+            for (const auto& order : it->second) {
+                level.total_volume += order.quantity;
+                ++level.order_count;
             }
-            std::cout << "  " << std::fixed << std::setprecision(2) << price
-                      << " | Vol " << total_volume << " | Orders " << order_count << "\n";
+            snapshot.bids.push_back(level);
+        }
+
+        int ask_count = 0;
+        for (AskBook::const_iterator it = asks_.begin(); it != asks_.end() && ask_count < depth; ++it, ++ask_count) {
+            LevelSnapshot level;
+            level.price = it->first;
+            for (const auto& order : it->second) {
+                level.total_volume += order.quantity;
+                ++level.order_count;
+            }
+            snapshot.asks.push_back(level);
+        }
+
+        return snapshot;
+    }
+
+    void get_snapshot(int depth) const {
+        SnapshotData snapshot = get_snapshot_data(depth);
+
+        std::cout << "\n=== Market Data Snapshot (depth=" << depth << ") ===\n";
+        std::cout << "Best Bids:\n";
+        for (const auto& level : snapshot.bids) {
+            std::cout << "  " << std::fixed << std::setprecision(2) << level.price
+                      << " | Vol " << level.total_volume << " | Orders " << level.order_count << "\n";
         }
 
         std::cout << "Best Asks:\n";
-        int ask_count = 0;
-        for (AskBook::const_iterator it = asks_.begin(); it != asks_.end() && ask_count < depth; ++it, ++ask_count) {
-            const double& price = it->first;
-            const std::list<Order>& orders = it->second;
-            long long total_volume = 0;
-            int order_count = 0;
-            for (const auto& order : orders) {
-                total_volume += order.quantity;
-                ++order_count;
-            }
-            std::cout << "  " << std::fixed << std::setprecision(2) << price
-                      << " | Vol " << total_volume << " | Orders " << order_count << "\n";
+        for (const auto& level : snapshot.asks) {
+            std::cout << "  " << std::fixed << std::setprecision(2) << level.price
+                      << " | Vol " << level.total_volume << " | Orders " << level.order_count << "\n";
         }
-
         std::cout << "============================\n";
     }
 
@@ -146,6 +169,13 @@ private:
 
     uint64_t match_buy(const Order& incoming_order) {
         Order remaining = incoming_order;
+
+        if (incoming_order.type == OrderType::FOK) {
+            if (!can_fully_fill_buy(remaining)) {
+                std::cout << "FOK: BUY " << remaining.id << " rejected, not enough liquidity to fill entire quantity.\n";
+                return remaining.id;
+            }
+        }
 
         while (remaining.quantity > 0 && !asks_.empty() && remaining.price >= asks_.begin()->first) {
             AskBook::iterator best_ask_it = asks_.begin();
@@ -180,9 +210,14 @@ private:
         }
 
         if (remaining.quantity > 0) {
-            add_resting_order(remaining, &bids_[remaining.price]);
-            std::cout << "ORDER REST: BUY " << remaining.id << " left resting " << remaining.quantity
-                      << " @ " << std::fixed << std::setprecision(2) << remaining.price << "\n";
+            if (incoming_order.type == OrderType::IOC) {
+                std::cout << "IOC: BUY " << remaining.id << " canceled " << remaining.quantity
+                          << " unfilled units.\n";
+            } else if (incoming_order.type == OrderType::GTC) {
+                add_resting_order(remaining, &bids_[remaining.price]);
+                std::cout << "ORDER REST: BUY " << remaining.id << " left resting " << remaining.quantity
+                          << " @ " << std::fixed << std::setprecision(2) << remaining.price << "\n";
+            }
         }
 
         return incoming_order.id;
@@ -190,6 +225,13 @@ private:
 
     uint64_t match_sell(const Order& incoming_order) {
         Order remaining = incoming_order;
+
+        if (incoming_order.type == OrderType::FOK) {
+            if (!can_fully_fill_sell(remaining)) {
+                std::cout << "FOK: SELL " << remaining.id << " rejected, not enough liquidity to fill entire quantity.\n";
+                return remaining.id;
+            }
+        }
 
         while (remaining.quantity > 0 && !bids_.empty() && remaining.price <= bids_.begin()->first) {
             BidBook::iterator best_bid_it = bids_.begin();
@@ -224,12 +266,49 @@ private:
         }
 
         if (remaining.quantity > 0) {
-            add_resting_order(remaining, &asks_[remaining.price]);
-            std::cout << "ORDER REST: SELL " << remaining.id << " left resting " << remaining.quantity
-                      << " @ " << std::fixed << std::setprecision(2) << remaining.price << "\n";
+            if (incoming_order.type == OrderType::IOC) {
+                std::cout << "IOC: SELL " << remaining.id << " canceled " << remaining.quantity
+                          << " unfilled units.\n";
+            } else if (incoming_order.type == OrderType::GTC) {
+                add_resting_order(remaining, &asks_[remaining.price]);
+                std::cout << "ORDER REST: SELL " << remaining.id << " left resting " << remaining.quantity
+                          << " @ " << std::fixed << std::setprecision(2) << remaining.price << "\n";
+            }
         }
 
         return incoming_order.id;
+    }
+
+    bool can_fully_fill_buy(const Order& order) const {
+        long long required = order.quantity;
+        for (const auto& ask_level : asks_) {
+            if (order.price < ask_level.first) {
+                break;
+            }
+            for (const auto& resting_order : ask_level.second) {
+                required -= resting_order.quantity;
+                if (required <= 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool can_fully_fill_sell(const Order& order) const {
+        long long required = order.quantity;
+        for (const auto& bid_level : bids_) {
+            if (order.price > bid_level.first) {
+                break;
+            }
+            for (const auto& resting_order : bid_level.second) {
+                required -= resting_order.quantity;
+                if (required <= 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     void add_resting_order(const Order& resting_order, std::list<Order>* level) {
@@ -270,6 +349,7 @@ void benchmark_random_orders(OrderBook& book, size_t order_count) {
     std::uniform_real_distribution<double> price_dist(95.0, 105.0);
     std::uniform_int_distribution<int> side_dist(0, 1);
     std::uniform_int_distribution<int> qty_dist(1, 25);
+    std::uniform_int_distribution<int> type_dist(0, 2);
 
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -277,7 +357,16 @@ void benchmark_random_orders(OrderBook& book, size_t order_count) {
         const double price = price_dist(rng);
         const long long quantity = qty_dist(rng);
         const bool is_buy = side_dist(rng) == 0;
-        book.add_order(price, quantity, is_buy);
+        const int type_choice = type_dist(rng);
+        OrderType type = OrderType::GTC;
+
+        if (type_choice == 1) {
+            type = OrderType::IOC;
+        } else if (type_choice == 2) {
+            type = OrderType::FOK;
+        }
+
+        book.add_order(price, quantity, is_buy, type);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -297,22 +386,35 @@ int main() {
 
     std::cout << "Production-grade Limit Order Book Demo\n";
 
-    std::cout << "\n--- Price-Time Priority / Partial Fill Demo ---\n";
-    uint64_t buy_1 = book.add_order(100.00, 10, true);
-    uint64_t buy_2 = book.add_order(100.00, 8, true);
-    uint64_t sell_1 = book.add_order(99.50, 12, false);
-    uint64_t sell_2 = book.add_order(99.50, 6, false);
+    std::cout << "\n--- IOC / FOK / Snapshot Demo ---\n";
+    auto it0 = book.add_order(100.00, 10, true); // GTC buy
+    auto it1 = book.add_order(100.00, 8, true);  // GTC buy
+    auto it2 = book.add_order(99.50, 12, false); // GTC sell
+    auto it3 = book.add_order(99.50, 6, false);  // GTC sell
+    (void)it0;
+    (void)it1;
+    (void)it2;
+    (void)it3;
 
-    std::cout << "\nCancel order " << buy_2 << ": " << (book.cancel_order(buy_2) ? "CANCELLED" : "NOT_FOUND") << "\n";
+    std::cout << "\nBefore IOC/FOK checks:\n";
+    book.get_snapshot(5);
+
+    std::cout << "\nIOC buy test: \n";
+    book.add_order(100.20, 25, true, OrderType::IOC);
+    book.get_snapshot(5);
+
+    std::cout << "\nFOK sell test: \n";
+    book.add_order(99.80, 50, false, OrderType::FOK);
     book.get_snapshot(5);
 
     std::cout << "\n--- Partial Fill / Queue Retention Demo ---\n";
-    uint64_t aggressor_buy = book.add_order(100.20, 5, true);
-    (void)aggressor_buy;
-    std::cout << "\nAfter partial fill demo:\n";
+    auto buy_id = book.add_order(101.00, 15, true);
+    auto sell_id = book.add_order(100.50, 20, false);
+    (void)buy_id;
+    (void)sell_id;
     book.get_snapshot(5);
 
-    std::cout << "\nCancel order " << sell_1 << ": " << (book.cancel_order(sell_1) ? "CANCELLED" : "NOT_FOUND") << "\n";
+    std::cout << "\nCancel order " << buy_id << ": " << (book.cancel_order(buy_id) ? "CANCELLED" : "NOT_FOUND") << "\n";
 
     benchmark_random_orders(book, 100000);
     return 0;
