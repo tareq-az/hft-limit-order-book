@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <windows.h>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -127,7 +128,7 @@ public:
     }
 
     void export_json(const std::string& filename) const {
-        std::ofstream out(filename);
+        std::ofstream out(filename, std::ios::out | std::ios::trunc);
         if (!out.is_open()) {
             std::cerr << "Failed to open JSON export file: " << filename << "\n";
             return;
@@ -143,44 +144,43 @@ public:
             << ", \"quantity\": " << best_ask.total_volume << "},\n";
         out << "  \"bids\": [\n";
 
-        int bid_index = 0;
+        bool first_bid = true;
         for (BidBook::const_iterator it = bids_.begin(); it != bids_.end(); ++it) {
             long long total_qty = 0;
             for (const auto& order : it->second) {
                 total_qty += order.quantity;
             }
 
+            if (!first_bid) {
+                out << ",\n";
+            }
+            first_bid = false;
+
             out << "    {\"price\": " << std::fixed << std::setprecision(2) << it->first
                 << ", \"quantity\": " << total_qty << "}";
-            if (++bid_index < static_cast<int>(std::distance(bids_.begin(), std::next(it, 1)))) {
-                // no-op; fallback is handled by iterator count below
-            }
-            if (std::next(it) != bids_.end()) {
-                out << ",";
-            }
-            out << "\n";
         }
-        out << "  ],\n";
+        out << "\n  ],\n";
 
         out << "  \"asks\": [\n";
-        int ask_index = 0;
+        bool first_ask = true;
         for (AskBook::const_iterator it = asks_.begin(); it != asks_.end(); ++it) {
             long long total_qty = 0;
             for (const auto& order : it->second) {
                 total_qty += order.quantity;
             }
 
+            if (!first_ask) {
+                out << ",\n";
+            }
+            first_ask = false;
+
             out << "    {\"price\": " << std::fixed << std::setprecision(2) << it->first
                 << ", \"quantity\": " << total_qty << "}";
-            if (std::next(it) != asks_.end()) {
-                out << ",";
-            }
-            out << "\n";
-            ++ask_index;
         }
-        out << "  ]\n";
+        out << "\n  ]\n";
         out << "}\n";
 
+        out.flush();
         out.close();
     }
 
@@ -548,59 +548,29 @@ void benchmark_random_orders(OrderBook& book, size_t order_count) {
 
 int main() {
     OrderBook book;
-
-    std::cout << "Production-grade Limit Order Book Demo\n";
-
-    std::cout << "\n--- IOC / FOK / POST_ONLY / Snapshot Demo ---\n";
-    auto buy1 = book.add_order(100.00, 10, true);
-    auto buy2 = book.add_order(100.00, 8, true);
-    auto sell1 = book.add_order(99.50, 12, false);
-    auto sell2 = book.add_order(99.50, 6, false);
-    (void)buy1;
-    (void)buy2;
-    (void)sell1;
-    (void)sell2;
-
-    std::cout << "\nPOST_ONLY rejected because it would cross:\n";
-    book.add_order(99.60, 5, true, OrderType::POST_ONLY);
-    std::cout << "Best bid: " << std::fixed << std::setprecision(2) << book.get_best_bid().price
-              << " | Best ask: " << std::fixed << std::setprecision(2) << book.get_best_ask().price << "\n";
-
-    std::cout << "\nIOC buy test:\n";
-    auto ioc_buy = book.add_order(100.20, 25, true, OrderType::IOC);
-    std::cout << "IOC buy status: " << (book.get_order_status(ioc_buy) == OrderStatus::CANCELED ? "CANCELED" : "OTHER") << "\n";
-    book.get_snapshot(5);
-
-    std::cout << "\nFOK sell test:\n";
-    auto fok_sell = book.add_order(99.80, 50, false, OrderType::FOK);
-    std::cout << "FOK sell status: " << (book.get_order_status(fok_sell) == OrderStatus::REJECTED ? "REJECTED" : "OTHER") << "\n";
-    book.get_snapshot(5);
-
-    std::cout << "\n--- Partial Fill / Queue Retention Demo ---\n";
-    auto buy_id = book.add_order(101.00, 15, true);
-    auto sell_id = book.add_order(100.50, 20, false);
-    std::cout << "Buy status: " << (book.get_order_status(buy_id) == OrderStatus::NEW ? "NEW" : "OTHER") << "\n";
-    std::cout << "Sell status: " << (book.get_order_status(sell_id) == OrderStatus::PARTIALLY_FILLED ? "PARTIALLY_FILLED" : "OTHER") << "\n";
-    book.get_snapshot(5);
-
-    std::cout << "\nCancel order " << buy_id << ": " << (book.cancel_order(buy_id) ? "CANCELLED" : "NOT_FOUND") << "\n";
-    std::cout << "Order " << buy_id << " status after cancel: " << (book.get_order_status(buy_id) == OrderStatus::CANCELED ? "CANCELED" : "OTHER") << "\n";
-
-    std::cout << "\n--- Live JSON Export Simulation ---\n";
     std::mt19937_64 rng(123);
-    std::uniform_real_distribution<double> live_price_dist(98.0, 104.0);
-    std::uniform_int_distribution<int> live_qty_dist(1, 12);
-    std::uniform_int_distribution<int> live_side_dist(0, 1);
+    std::uniform_real_distribution<double> price_dist(98.0, 104.0);
+    std::uniform_int_distribution<int> qty_dist(1, 12);
+    std::uniform_int_distribution<int> side_dist(0, 1);
 
-    for (int i = 0; i < 8; ++i) {
-        const bool is_buy = live_side_dist(rng) == 0;
-        const double price = live_price_dist(rng);
-        const long long qty = live_qty_dist(rng);
+    std::cout << "HFT Order Book live stream started. Writing orderbook_data.json every 500ms...\n";
+
+    int tick = 0;
+    while (true) {
+        const bool is_buy = side_dist(rng) == 0;
+        const double price = price_dist(rng);
+        const long long qty = qty_dist(rng);
+
         book.add_order(price, qty, is_buy, OrderType::GTC);
-        std::cout << "Live update " << i + 1 << ": exported to orderbook_data.json\n";
-        Sleep(200);
+        book.export_json("orderbook_data.json");
+
+        std::cout << "tick " << ++tick
+                  << " | best_bid=" << std::fixed << std::setprecision(2) << book.get_best_bid().price
+                  << " | best_ask=" << std::fixed << std::setprecision(2) << book.get_best_ask().price
+                  << " | file=orderbook_data.json\n";
+
+        Sleep(500);
     }
 
-    benchmark_random_orders(book, 100000);
     return 0;
 }

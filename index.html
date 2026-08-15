@@ -132,29 +132,67 @@
     </div>
 
     <script>
+        const DATA_URL = new URL('./orderbook_data.json', window.location.href).toString();
+
+        function parseNumber(value, fallback = 0) {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? parsed : fallback;
+        }
+
+        function renderEmptyState(tableId, label) {
+            const tbody = document.getElementById(tableId);
+            tbody.innerHTML = `<tr><td colspan="3" style="color: var(--text-muted); text-align: center; padding: 12px;">${label}</td></tr>`;
+        }
+
         async function updateDashboard() {
             try {
-                const response = await fetch('orderbook_data.json?t=' + new Date().getTime());
-                const data = await response.json();
+                const response = await fetch(DATA_URL + '?t=' + Date.now(), {
+                    cache: 'no-store',
+                    headers: { 'Accept': 'application/json' }
+                });
 
-                // Stats Update
-                document.getElementById('best-bid').innerText = data.best_bid.toFixed(2);
-                document.getElementById('best-ask').innerText = data.best_ask.toFixed(2);
-                document.getElementById('spread').innerText = (data.best_ask - data.best_bid).toFixed(2);
+                if (!response.ok) {
+                    throw new Error('JSON not available yet');
+                }
 
-                // Render Bids
+                const text = await response.text();
+                if (!text.trim()) {
+                    throw new Error('Empty JSON payload');
+                }
+
+                const data = JSON.parse(text);
+                const bestBid = parseNumber(data.best_bid?.price ?? data.best_bid, 0);
+                const bestAsk = parseNumber(data.best_ask?.price ?? data.best_ask, 0);
+                const bids = Array.isArray(data.bids) ? data.bids : [];
+                const asks = Array.isArray(data.asks) ? data.asks : [];
+
+                document.getElementById('best-bid').innerText = bestBid.toFixed(2);
+                document.getElementById('best-ask').innerText = bestAsk.toFixed(2);
+                document.getElementById('spread').innerText = (bestAsk - bestBid).toFixed(2);
+
                 const bidsBody = document.getElementById('bids-body');
-                bidsBody.innerHTML = data.bids.map(b => 
-                    `<tr><td class="price-bid">${b.price.toFixed(2)}</td><td>${b.quantity}</td><td>${(b.price * b.quantity).toFixed(2)}</td></tr>`
-                ).join('');
+                if (bids.length === 0) {
+                    renderEmptyState('bids-body', 'Waiting for bids...');
+                } else {
+                    bidsBody.innerHTML = bids.map(b => {
+                        const price = parseNumber(b.price, 0);
+                        const quantity = parseNumber(b.quantity, 0);
+                        return `<tr><td class="price-bid">${price.toFixed(2)}</td><td>${quantity}</td><td>${(price * quantity).toFixed(2)}</td></tr>`;
+                    }).join('');
+                }
 
-                // Render Asks
                 const asksBody = document.getElementById('asks-body');
-                asksBody.innerHTML = data.asks.map(a => 
-                    `<tr><td class="price-ask">${a.price.toFixed(2)}</td><td>${a.quantity}</td><td>${(a.price * a.quantity).toFixed(2)}</td></tr>`
-                ).join('');
+                if (asks.length === 0) {
+                    renderEmptyState('asks-body', 'Waiting for asks...');
+                } else {
+                    asksBody.innerHTML = asks.map(a => {
+                        const price = parseNumber(a.price, 0);
+                        const quantity = parseNumber(a.quantity, 0);
+                        return `<tr><td class="price-ask">${price.toFixed(2)}</td><td>${quantity}</td><td>${(price * quantity).toFixed(2)}</td></tr>`;
+                    }).join('');
+                }
             } catch (e) {
-                console.log("Waiting for data...");
+                console.log('Waiting for orderbook_data.json...');
             }
         }
 
