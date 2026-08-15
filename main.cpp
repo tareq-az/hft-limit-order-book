@@ -1,6 +1,7 @@
 #include <algorithm>
-#include <chrono>
+#include <windows.h>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <list>
@@ -82,20 +83,26 @@ public:
             if (incoming_order.is_buy && !asks_.empty() && incoming_order.price >= asks_.begin()->first) {
                 std::cout << "POST_ONLY: BUY " << incoming_order.id << " rejected because it would match immediately.\n";
                 update_order_status(incoming_order.id, OrderStatus::REJECTED);
+                export_json("orderbook_data.json");
                 return incoming_order.id;
             }
             if (!incoming_order.is_buy && !bids_.empty() && incoming_order.price <= bids_.begin()->first) {
                 std::cout << "POST_ONLY: SELL " << incoming_order.id << " rejected because it would match immediately.\n";
                 update_order_status(incoming_order.id, OrderStatus::REJECTED);
+                export_json("orderbook_data.json");
                 return incoming_order.id;
             }
         }
 
+        uint64_t result = 0;
         if (incoming_order.is_buy) {
-            return match_buy(incoming_order);
+            result = match_buy(incoming_order);
+        } else {
+            result = match_sell(incoming_order);
         }
 
-        return match_sell(incoming_order);
+        export_json("orderbook_data.json");
+        return result;
     }
 
     bool cancel_order(uint64_t order_id) {
@@ -114,8 +121,67 @@ public:
         order_index_.erase(index_it);
         order_owners_.erase(order_id);
         update_order_status(order_id, OrderStatus::CANCELED);
+        export_json("orderbook_data.json");
 
         return true;
+    }
+
+    void export_json(const std::string& filename) const {
+        std::ofstream out(filename);
+        if (!out.is_open()) {
+            std::cerr << "Failed to open JSON export file: " << filename << "\n";
+            return;
+        }
+
+        LevelSnapshot best_bid = get_best_bid();
+        LevelSnapshot best_ask = get_best_ask();
+
+        out << "{\n";
+        out << "  \"best_bid\": {\"price\": " << std::fixed << std::setprecision(2) << best_bid.price
+            << ", \"quantity\": " << best_bid.total_volume << "},\n";
+        out << "  \"best_ask\": {\"price\": " << std::fixed << std::setprecision(2) << best_ask.price
+            << ", \"quantity\": " << best_ask.total_volume << "},\n";
+        out << "  \"bids\": [\n";
+
+        int bid_index = 0;
+        for (BidBook::const_iterator it = bids_.begin(); it != bids_.end(); ++it) {
+            long long total_qty = 0;
+            for (const auto& order : it->second) {
+                total_qty += order.quantity;
+            }
+
+            out << "    {\"price\": " << std::fixed << std::setprecision(2) << it->first
+                << ", \"quantity\": " << total_qty << "}";
+            if (++bid_index < static_cast<int>(std::distance(bids_.begin(), std::next(it, 1)))) {
+                // no-op; fallback is handled by iterator count below
+            }
+            if (std::next(it) != bids_.end()) {
+                out << ",";
+            }
+            out << "\n";
+        }
+        out << "  ],\n";
+
+        out << "  \"asks\": [\n";
+        int ask_index = 0;
+        for (AskBook::const_iterator it = asks_.begin(); it != asks_.end(); ++it) {
+            long long total_qty = 0;
+            for (const auto& order : it->second) {
+                total_qty += order.quantity;
+            }
+
+            out << "    {\"price\": " << std::fixed << std::setprecision(2) << it->first
+                << ", \"quantity\": " << total_qty << "}";
+            if (std::next(it) != asks_.end()) {
+                out << ",";
+            }
+            out << "\n";
+            ++ask_index;
+        }
+        out << "  ]\n";
+        out << "}\n";
+
+        out.close();
     }
 
     void print_book() const {
@@ -519,6 +585,21 @@ int main() {
 
     std::cout << "\nCancel order " << buy_id << ": " << (book.cancel_order(buy_id) ? "CANCELLED" : "NOT_FOUND") << "\n";
     std::cout << "Order " << buy_id << " status after cancel: " << (book.get_order_status(buy_id) == OrderStatus::CANCELED ? "CANCELED" : "OTHER") << "\n";
+
+    std::cout << "\n--- Live JSON Export Simulation ---\n";
+    std::mt19937_64 rng(123);
+    std::uniform_real_distribution<double> live_price_dist(98.0, 104.0);
+    std::uniform_int_distribution<int> live_qty_dist(1, 12);
+    std::uniform_int_distribution<int> live_side_dist(0, 1);
+
+    for (int i = 0; i < 8; ++i) {
+        const bool is_buy = live_side_dist(rng) == 0;
+        const double price = live_price_dist(rng);
+        const long long qty = live_qty_dist(rng);
+        book.add_order(price, qty, is_buy, OrderType::GTC);
+        std::cout << "Live update " << i + 1 << ": exported to orderbook_data.json\n";
+        Sleep(200);
+    }
 
     benchmark_random_orders(book, 100000);
     return 0;
